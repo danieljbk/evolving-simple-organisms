@@ -1,594 +1,679 @@
+# --- START OF FILE organism_v3.py ---
+
 # ------------------------------------------------------------------------------+
 #
 #   Nathan A. Rooy
 #   Evolving Simple Organisms
 #   2017-Nov.
 #
-#   Modified for live plotting (Qt5Agg), starvation, and robust window handling
+#   Modified for:
+#     - Live plotting (Qt5Agg)
+#     - Energy-based survival mechanic
+#     - Corpse creation on death (corpses are food)
+#     - Visual indicator for corpse eaters
+#     - Robust window handling
+#     - Food respawning on consumption
+#     - Energy-based organism collision (REVISED)
+#     - Organism sensing (NEW)
+#     - Limited food per generation (respawned)
+#     - Generation ends on death threshold or max time
+#     - Survivors carry over full state (pos, vel, etc.)
+#     - No explicit elitism; population filled with offspring of survivors.
+#   (Python 3.6 Compatible Syntax - CORRECTED)
 #
 # ------------------------------------------------------------------------------+
 
 # --- IMPORT DEPENDENCIES ------------------------------------------------------+
-
 from __future__ import division, print_function
 from collections import defaultdict
-import sys  # Used for checking python version if needed
-import time  # Added for pausing
+import sys
+import time
 import operator
-import traceback  # For printing errors
-
-# --- Force Matplotlib backend BEFORE importing pyplot ---
+import traceback
 import matplotlib
 
 try:
-    matplotlib.use("Qt5Agg")  # Use Qt5 backend for stability on macOS/conda
+    matplotlib.use("Qt5Agg")
 except ImportError:
-    print("Qt5Agg backend not available. Please install PyQt5:")
-    print("  conda install pyqt")
-    print("  or: pip install PyQt5")
+    print("Qt5Agg backend needed: conda install pyqt OR pip install PyQt5")
     sys.exit(1)
-
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import matplotlib.lines as lines
-
 import numpy as np
 from math import atan2, cos, degrees, floor, radians, sin, sqrt, inf
 from random import randint, random, sample, uniform
 
-# --- Attempt to import original plotting functions, provide fallbacks ---
+# --- Plotting Setup (Using external/fallback plotting from v1/v2) ---
 try:
-    # Assumes plotting.py is in the same directory
     from plotting import plot_food as plot_food_original
     from plotting import plot_organism as plot_organism_original
 
     print("Using plotting functions from plotting.py")
 
-    # Adapt the original plot_organism to handle 'is_alive'
-    # NOTE: This requires modifying the original plotting.py or accepting this override
-    def plot_organism_adapted(x, y, r, ax, is_alive):
-        if is_alive:
-            # Call the original function if alive
-            plot_organism_original(x, y, r, ax)
-        else:
-            # Plot dead organisms differently
-            circle = Circle(
-                [x, y],
-                0.04,
-                edgecolor="grey",
-                facecolor="lightgrey",
-                zorder=7,
-                alpha=0.7,
-            )
+    # --- Adapted plotting functions ---
+    def plot_food_adapted(x, y, ax, is_corpse):
+        if is_corpse:
+            circle = Circle([x, y], 0.035, ec="orange", fc="yellow", zorder=6)
             ax.add_artist(circle)
+        else:
+            plot_food_original(x, y, ax)
 
-    # Use the original food plotter directly
-    plot_food_external = plot_food_original
-    # Use the adapted organism plotter
+    def plot_organism_adapted(x, y, r, ax, is_alive, ate_corpse_recently):
+        if is_alive:
+            if ate_corpse_recently:
+                circle = Circle([x, y], 0.05, ec="darkred", fc="salmon", zorder=8)
+                ax.add_artist(circle)
+                edge = Circle([x, y], 0.05, facecolor="None", ec="darkred", zorder=8)
+                ax.add_artist(edge)
+                x2, y2 = x + cos(radians(r)) * 0.075, y + sin(radians(r)) * 0.075
+                ax.add_line(
+                    lines.Line2D(
+                        [x, x2], [y, y2], color="darkred", linewidth=1, zorder=10
+                    )
+                )
+            else:
+                plot_organism_original(x, y, r, ax)
+        else:
+            ax.add_artist(
+                Circle([x, y], 0.04, ec="grey", fc="lightgrey", zorder=7, alpha=0.7)
+            )
+
+    plot_food_external = plot_food_adapted
     plot_organism_external = plot_organism_adapted
-
 except ImportError:
     print("Warning: plotting.py not found. Using basic internal plotting functions.")
 
-    # Define basic fallback plotting functions
-    def plot_food_external(x, y, ax):
-        ax.plot(x, y, "bo", markersize=4, alpha=0.6)  # Basic blue dot for food
+    def plot_food_external(x, y, ax, is_corpse):
+        color, edgec, size = (
+            ("yellow", "orange", 5) if is_corpse else ("blue", "darkblue", 4)
+        )
+        ax.plot(x, y, "o", mfc=color, mec=edgec, ms=size, alpha=0.8)
 
-    def plot_organism_external(x, y, r, ax, is_alive):  # Include is_alive flag
+    def plot_organism_external(x, y, r, ax, is_alive, ate_corpse_recently):
         if is_alive:
-            ax.plot(x, y, "go", markersize=8)  # Basic green dot
-            line_length = 0.1
-            end_x = x + line_length * cos(radians(r))
-            end_y = y + line_length * sin(radians(r))
-            ax.plot(
-                [x, end_x], [y, end_y], "k-", linewidth=1
-            )  # Basic black direction line
+            color, edgec, linec = (
+                ("salmon", "darkred", "darkred")
+                if ate_corpse_recently
+                else ("lightgreen", "darkgreen", "black")
+            )
+            ax.plot(x, y, "o", mfc=color, mec=edgec, ms=8)
+            ex, ey = x + 0.1 * cos(radians(r)), y + 0.1 * sin(radians(r))
+            ax.plot([x, ex], [y, ey], "-", color=linec, lw=1)
         else:
-            ax.plot(
-                x, y, "o", color="grey", markersize=6, alpha=0.5
-            )  # Grey dot for dead
+            ax.plot(x, y, "o", color="grey", ms=6, alpha=0.5)
 
 
 # --- CONSTANTS / SETTINGS -----------------------------------------------------+
-
 settings = {}
-
-# EVOLUTION SETTINGS
-settings["pop_size"] = 50  # number of organisms
-settings["food_num"] = 100  # number of food particles
-settings["gens"] = 50  # number of generations
-settings["elitism"] = 0.20  # elitism (fraction of top living performers)
-settings["mutate"] = 0.10  # mutation rate
-
-# SIMULATION SETTINGS
-settings["gen_time"] = 100  # generation length         (seconds)
-settings["dt"] = 0.04  # simulation time step      (dt) => 2500 steps/gen
-settings["dr_max"] = 720  # max rotational speed      (degrees per second)
-settings["v_max"] = 0.5  # max velocity              (units per second)
-settings["dv_max"] = 0.25  # max acceleration (+/-)    (units per second^2)
-settings["collision_radius"] = 0.075  # Radius for eating food
-
-# --- NEW SURVIVAL SETTING ---
-# Represents number of time steps without food before dying.
-# Example: 250 steps = 10 seconds (250 * 0.04)
-settings["starvation_threshold"] = 250  # Adjust for difficulty
-
-# ARENA BOUNDARIES
-settings["x_min"] = -2.0
-settings["x_max"] = 2.0
-settings["y_min"] = -2.0
-settings["y_max"] = 2.0
-
-# --- Plotting Settings ---
-settings["plot"] = True  # LIVE plot the simulation?
-settings["plot_interval"] = 10  # Plot every N time steps
-
-# ORGANISM NEURAL NET SETTINGS
-settings["inodes"] = 1  # Input: Normalized heading to nearest food [-1, 1]
-settings["hnodes"] = 5  # Hidden nodes
-settings["onodes"] = 2  # Output: [dV scale, dR scale], both [-1, 1]
+# EVOLUTION
+settings["pop_size"] = 50
+settings["food_num"] = 50
+settings["gens"] = 10000
+settings["elitism"] = 0.0
+settings["mutate"] = 0.05
+# SIMULATION
+settings["gen_time"] = 500
+settings["dt"] = 0.04
+settings["dr_max"] = 720  # Max Rotational speed change (degrees/sec)
+settings["v_max"] = 0.5  # Max Velocity (units/sec)
+settings["dv_max"] = 0.05  # Max Velocity change (units/sec^2)
+settings["collision_radius"] = 0.075  # Radius for food eating and organism collision
+settings["sensor_radius"] = 0.8  # <<< NEW: Radius for sensing other organisms
+settings["bounce_velocity_multiplier"] = (
+    1.0  # Velocity multiplier after losing collision
+)
+settings["debug_collisions"] = False  # <<< NEW: Set True to print collision details
+# ENERGY & SURVIVAL
+_base_survival_steps = 100
+settings["initial_energy"] = _base_survival_steps
+settings["energy_per_food"] = _base_survival_steps
+settings["corpse_energy_multiplier"] = 3.0
+settings["corpse_fitness_value"] = 3
+settings["energy_per_step"] = 1
+settings["max_energy"] = _base_survival_steps * 5
+settings["death_threshold_percent"] = 0.75
+# ARENA & PLOTTING
+settings["x_min"], settings["x_max"] = -2.0, 2.0
+settings["y_min"], settings["y_max"] = -2.0, 2.0
+settings["plot"] = True
+settings["plot_interval"] = 10
+# NN
+settings["inodes"] = 3  # <<< UPDATED: Input Nodes (r_food, r_org, d_org_norm)
+settings["hnodes"] = 5  # Hidden Nodes
+settings["onodes"] = 2  # Output Nodes (dv, dr)
 
 # --- GLOBAL PLOT VARIABLES ----------------------------------------------------+
 fig, ax = None, None
-simulation_stopped_early = False  # Flag to track if user closed plot window
-
-# --- HELPER FUNCTIONS ---------------------------------------------------------+
+simulation_stopped_early = False
 
 
+# --- HELPER FUNCTIONS (dist, calc_heading, setup_live_plot are unchanged) -----+
 def dist(x1, y1, x2, y2):
-    """Calculate Euclidean distance."""
     return sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
 
 
-def calc_heading(org, food):
-    """Calculate normalized heading from organism to food (-1 to 1)."""
-    d_x = food.x - org.x
-    d_y = food.y - org.y
-    # Angle from org's positive x-axis to food, in degrees
-    absolute_angle_to_food = degrees(atan2(d_y, d_x))
-    # Relative angle difference, accounting for org's current orientation 'r'
-    relative_angle = absolute_angle_to_food - org.r
+# Calculates relative angle normalized to [-1, 1]
+def calc_heading(source_org, target_x, target_y):
+    d_x = target_x - source_org.x
+    d_y = target_y - source_org.y
+    target_angle_rad = atan2(d_y, d_x)
+    relative_angle_deg = degrees(target_angle_rad) - source_org.r
 
-    # Normalize angle to be within [-180, 180]
-    while relative_angle <= -180:
-        relative_angle += 360
-    while relative_angle > 180:
-        relative_angle -= 360
+    # Normalize angle to [-180, 180]
+    while relative_angle_deg <= -180:
+        relative_angle_deg += 360
+    while relative_angle_deg > 180:
+        relative_angle_deg -= 360
 
-    # Normalize to [-1, 1] for the neural network input
-    return relative_angle / 180.0
+    # Normalize to [-1, 1] for NN input
+    return relative_angle_deg / 180.0
 
 
 def setup_live_plot(settings):
-    """Initializes the plot figure and axes for live plotting."""
     global fig, ax
     print("Setting up plot...")
     fig, ax = plt.subplots(figsize=(8, 8))
-    plt.ion()  # Turn on interactive mode
+    plt.ion()
     ax.set_aspect("equal", adjustable="box")
-    # Set limits with padding
     ax.set_xlim([settings["x_min"] - 0.5, settings["x_max"] + 0.5])
     ax.set_ylim([settings["y_min"] - 0.5, settings["y_max"] + 0.5])
-    plt.show()  # Show the plot window immediately
-    # Need a tiny pause for plot window to actually appear sometimes
+    plt.show()
     plt.pause(0.1)
     print("Plot setup complete.")
 
 
+# --- Modified plot_frame_live (Unchanged from v1/v2) ---
 def plot_frame_live(settings, organisms, foods, gen, time_step):
-    """Updates the existing plot figure for live visualization."""
     global fig, ax
-    # If the main figure doesn't exist anymore, do nothing.
     if fig is None or ax is None or not plt.fignum_exists(fig.number):
         return
-
-    ax.clear()  # Clear previous drawings
-
-    # Re-apply limits and title every frame (clearing axes removes them)
+    ax.clear()
     ax.set_xlim([settings["x_min"] - 0.5, settings["x_max"] + 0.5])
     ax.set_ylim([settings["y_min"] - 0.5, settings["y_max"] + 0.5])
     ax.set_title(f"Generation: {gen} | Time Step: {time_step}")
-
-    # Plot food particles
     for food in foods:
-        plot_food_external(food.x, food.y, ax)
-
-    # Plot organisms (distinguishing alive/dead)
-    for organism in organisms:
+        if food.is_active:
+            plot_food_external(food.x, food.y, ax, food.is_corpse)
+    for org in organisms:
         plot_organism_external(
-            organism.x, organism.y, organism.r, ax, organism.is_alive
+            org.x, org.y, org.r, ax, org.is_alive, org.ate_corpse_recently
         )
-
-    # Re-apply aspect ratio
     ax.set_aspect("equal", adjustable="box")
-
-    # Draw and pause for GUI update
     plt.draw()
-    plt.pause(0.001)  # Minimal pause crucial for interactivity
+    plt.pause(0.001)
 
 
-# --- EVOLUTION FUNCTION -------------------------------------------------------+
-
-
+# --- EVOLUTION FUNCTION (Handles potential NN shape change) ---
 def evolve(settings, organisms_old, gen):
-    """Evolves the population using only *living* organisms from organisms_old."""
+    survivors = [org for org in organisms_old if org.is_alive]
+    num_survivors = len(survivors)
+    print(f"  [Gen {gen-1}] Survivors: {num_survivors}/{settings['pop_size']}")
 
-    # --- Filter out dead organisms ---
-    living_organisms = [org for org in organisms_old if org.is_alive]
-    num_living = len(living_organisms)
-    print(
-        f"  [Gen {gen-1}] Survivors: {num_living}/{settings['pop_size']}"
-    )  # End of previous gen results
+    if num_survivors == 0:
+        print(f"  ##### EXTINCTION in Gen {gen-1}! Simulation will end. #####")
+        return [], defaultdict(float, {"COUNT": 0})
 
-    # --- Handle Extinction ---
-    if num_living == 0:
-        print(
-            f"  EXTINCTION in Gen {gen-1}! Creating new random population for Gen {gen}."
-        )
-        organisms_new = [
-            organism(settings, name=f"gen[{gen}]-org[new{i}]")
-            for i in range(settings["pop_size"])
-        ]
-        stats = defaultdict(float, {"BEST": 0, "WORST": 0, "AVG": 0, "COUNT": 0})
-        return organisms_new, stats
-
-    # --- Calculate selection numbers based on living population ---
-    # Elitism based on fraction of *living* population
-    elitism_num_actual = int(floor(settings["elitism"] * num_living))
-    elitism_num_actual = min(
-        elitism_num_actual, num_living
-    )  # Cannot exceed number living
-
-    # Number of offspring needed to refill population to pop_size
-    num_offspring_needed = settings["pop_size"] - elitism_num_actual
-
-    # --- GET STATS FROM *LIVING* SURVIVORS ----------------+
-    stats = defaultdict(float)
-    stats["WORST"] = float("inf")
-    for org in living_organisms:  # Iterate over living only
-        fitness = org.fitness  # Fitness accumulated during the simulation just ended
-        if fitness > stats["BEST"]:
-            stats["BEST"] = fitness
-        if fitness < stats["WORST"]:
-            stats["WORST"] = fitness
+    stats = defaultdict(float, {"WORST": float("inf"), "BEST": 0.0, "SUM": 0.0})
+    for org in survivors:
+        fitness = org.fitness
+        stats["BEST"] = max(stats["BEST"], fitness)
+        stats["WORST"] = min(stats["WORST"], fitness)
         stats["SUM"] += fitness
-
-    stats["COUNT"] = num_living  # Store count of living organisms
-    stats["AVG"] = stats["SUM"] / num_living if num_living > 0 else 0.0
+    stats["COUNT"] = num_survivors
+    stats["AVG"] = stats["SUM"] / num_survivors if num_survivors > 0 else 0.0
     if stats["WORST"] == float("inf"):
-        stats["WORST"] = 0.0  # Handle case if all survivors had 0 fitness
+        stats["WORST"] = 0.0
 
-    # --- ELITISM (Keep best *living* organisms' weights) ---
-    orgs_sorted = sorted(
-        living_organisms, key=operator.attrgetter("fitness"), reverse=True
-    )
     organisms_new = []
-    # Create new organism objects for the next generation, copying elite weights
-    for i in range(elitism_num_actual):
-        elite_org = orgs_sorted[i]
-        # The organism() constructor will reset position/velocity/alive status
-        organisms_new.append(
-            organism(
-                settings,
-                wih=elite_org.wih.copy(),
-                who=elite_org.who.copy(),
-                name=elite_org.name,
+    # Keep survivors - they retain their state (pos, vel, energy, weights)
+    for survivor in survivors:
+        # Check if survivor's weights match current NN settings
+        # If inodes changed, the old weights are incompatible. Reinitialize.
+        # This simulates a "mutation" forced by changing sensor morphology.
+        if survivor.wih.shape[1] != settings["inodes"]:
+            print(
+                f"  Survivor {survivor.name} has incompatible input weights ({survivor.wih.shape}). Reinitializing wih."
             )
-        )
+            survivor.wih = np.random.uniform(
+                -1, 1, (settings["hnodes"], settings["inodes"])
+            )
+            # Optionally reinitialize who as well, or just let evolution adapt it.
+            # survivor.who = np.random.uniform(-1, 1, (settings["onodes"], settings["hnodes"]))
 
-    # --- GENERATE NEW ORGANISMS (Breed from elites) --------+
-    # Use the newly created elite organisms as the parent pool
-    parent_pool = organisms_new[:]
+        # Reset fitness, alive status etc for the *next* generation simulation
+        # (This is now done at the start of simulate(), keep state here)
+        organisms_new.append(survivor)
 
-    # Fallback if elite pool is empty (e.g., elitism=0, but some survived)
-    if not parent_pool and orgs_sorted:
-        print("  Warning: Elite pool empty, using top survivors as parents.")
-        # Use top N survivors directly as parents (take their weights)
-        # Select up to, say, 5 potential parents or all survivors if fewer
-        potential_parents_data = [
-            (org.wih.copy(), org.who.copy())
-            for org in orgs_sorted[: min(5, len(orgs_sorted))]
-        ]
-        if not potential_parents_data:  # Should not happen if num_living > 0
-            print("  Error: Could not identify any parents.")
-            parent_pool = []  # Will trigger random fill below
+    # Breed offspring to fill remaining spots
+    spots_to_fill = settings["pop_size"] - num_survivors
+    parent_pool = survivors
+    if spots_to_fill > 0:
+        for i in range(spots_to_fill):
+            parent1, parent2 = (
+                sample(parent_pool, 2)
+                if num_survivors >= 2
+                else (parent_pool[0], parent_pool[0])
+            )
 
-    # If still no valid parents, fill with random
-    if not parent_pool and not potential_parents_data:
-        print(
-            "  Error: Cannot select parents. Filling generation with random organisms."
-        )
-        while len(organisms_new) < settings["pop_size"]:
+            # Crossover weights
+            c_weight = random()
+            wih_new = (c_weight * parent1.wih) + ((1 - c_weight) * parent2.wih)
+            who_new = (c_weight * parent1.who) + ((1 - c_weight) * parent2.who)
+
+            # Mutation
+            if random() <= settings["mutate"]:
+                mat, h, inn, o = (
+                    randint(0, 1),
+                    settings["hnodes"],
+                    settings["inodes"],
+                    settings["onodes"],
+                )
+                if mat == 0 and h > 0 and inn > 0 and wih_new.size > 0:
+                    r, c = randint(0, h - 1), randint(0, inn - 1)
+                    wih_new[r, c] = max(
+                        -1.0, min(1.0, wih_new[r, c] + uniform(-0.1, 0.1))
+                    )  # Additive mutation
+                elif mat == 1 and o > 0 and h > 0 and who_new.size > 0:
+                    r, c = randint(0, o - 1), randint(0, h - 1)
+                    who_new[r, c] = max(
+                        -1.0, min(1.0, who_new[r, c] + uniform(-0.1, 0.1))
+                    )  # Additive mutation
+
+            # Ensure offspring weights match current settings (should happen naturally if parents match)
+            if wih_new.shape != (settings["hnodes"], settings["inodes"]):
+                wih_new = np.random.uniform(
+                    -1, 1, (settings["hnodes"], settings["inodes"])
+                )
+            if who_new.shape != (settings["onodes"], settings["hnodes"]):
+                who_new = np.random.uniform(
+                    -1, 1, (settings["onodes"], settings["hnodes"])
+                )
+
+            offspring_name = f"gen[{gen}]-offspring[{i}]"
+            # Offspring start with default state (random pos, vel, initial energy)
             organisms_new.append(
                 organism(
-                    settings, name=f"gen[{gen}]-org[rand_fill{len(organisms_new)}]"
+                    settings,
+                    wih=wih_new,
+                    who=who_new,
+                    name=offspring_name,
+                    initial_state=None,
                 )
             )
 
-    else:  # Normal breeding loop
-        current_offspring_count = 0
-        while len(organisms_new) < settings["pop_size"]:
-            # Select parents
-            if "potential_parents_data" in locals() and potential_parents_data:
-                # If using fallback pool, sample weights directly
-                p1_idx, p2_idx = (
-                    sample(range(len(potential_parents_data)), 2)
-                    if len(potential_parents_data) >= 2
-                    else (0, 0)
-                )
-                p1_wih, p1_who = potential_parents_data[p1_idx]
-                p2_wih, p2_who = potential_parents_data[p2_idx]
-            elif parent_pool:
-                # If using elite pool, sample organism objects
-                parent1, parent2 = (
-                    sample(parent_pool, 2)
-                    if len(parent_pool) >= 2
-                    else (parent_pool[0], parent_pool[0])
-                )
-                p1_wih, p1_who = parent1.wih, parent1.who
-                p2_wih, p2_who = parent2.wih, parent2.who
-            else:
-                # Should be impossible state if logic above is correct, but safety break
-                print("  Error in breeding loop parent selection.")
-                break
-
-            # CROSSOVER
-            crossover_weight = random()
-            wih_new = (crossover_weight * p1_wih) + ((1 - crossover_weight) * p2_wih)
-            who_new = (crossover_weight * p1_who) + ((1 - crossover_weight) * p2_who)
-
-            # MUTATION
-            if random() <= settings["mutate"]:
-                mat_pick = randint(0, 1)
-                # Mutate WIH
-                if mat_pick == 0 and settings["hnodes"] > 0 and settings["inodes"] > 0:
-                    idx_row, idx_col = randint(0, settings["hnodes"] - 1), randint(
-                        0, settings["inodes"] - 1
-                    )
-                    wih_new[idx_row, idx_col] *= uniform(0.9, 1.1)
-                    wih_new[idx_row, idx_col] = max(
-                        -1.0, min(wih_new[idx_row, idx_col], 1.0)
-                    )
-                # Mutate WHO
-                elif (
-                    mat_pick == 1 and settings["onodes"] > 0 and settings["hnodes"] > 0
-                ):
-                    idx_row, idx_col = randint(0, settings["onodes"] - 1), randint(
-                        0, settings["hnodes"] - 1
-                    )
-                    who_new[idx_row, idx_col] *= uniform(0.9, 1.1)
-                    who_new[idx_row, idx_col] = max(
-                        -1.0, min(who_new[idx_row, idx_col], 1.0)
-                    )
-
-            # Add the offspring (constructor resets state)
-            new_name = f"gen[{gen}]-org[{elitism_num_actual + current_offspring_count}]"
-            organisms_new.append(
-                organism(settings, wih=wih_new, who=who_new, name=new_name)
-            )
-            current_offspring_count += 1
-
-    # Return the new generation list, ensuring correct size
     return organisms_new[: settings["pop_size"]], stats
 
 
-# --- SIMULATION FUNCTION ------------------------------------------------------+
-
-
+# --- SIMULATION FUNCTION (Revised: Organism sensing, Revised collision) -------+
 def simulate(settings, organisms, foods, gen):
-    """Runs simulation physics and logic for one generation.
-    Includes starvation checks.
-    Returns: tuple (updated_organisms_list, was_window_closed_flag)
-    """
-    global fig  # To check if plot window exists
+    global fig
 
-    total_time_steps = int(settings["gen_time"] / settings["dt"])
+    max_time_steps = int(settings["gen_time"] / settings["dt"])
     plot_interval = settings.get("plot_interval", 1)
-    starvation_threshold = settings["starvation_threshold"]
+    initial_energy = settings["initial_energy"]
+    energy_per_food = settings["energy_per_food"]
+    energy_per_step = settings["energy_per_step"]
+    max_energy = settings["max_energy"]
+    corpse_energy_gain = energy_per_food * settings["corpse_energy_multiplier"]
+    corpse_fitness = settings["corpse_fitness_value"]
+    death_limit_count = int(settings["pop_size"] * settings["death_threshold_percent"])
+    collision_radius_sq = settings["collision_radius"] ** 2
+    sensor_radius = settings["sensor_radius"]
+    sensor_radius_sq = sensor_radius**2  # For efficiency
+    bounce_vel_mult = settings["bounce_velocity_multiplier"]
+    debug_collisions = settings["debug_collisions"]
 
-    # --- Reset organism state for the START of this generation's simulation ---
-    # Important: Ensures organisms carried over by elitism don't retain
-    # high fitness or dead status from the previous generation's *simulation*.
-    # Their *weights* are preserved by 'evolve'.
+    # Respawn any inactive food/corpses from previous generation
+    for food_item in foods:
+        if not food_item.is_active:
+            food_item.respawn(settings)
+
+    # Reset Organism State for the new generation simulation
+    # Survivors keep their position, velocity, orientation, and weights from last gen
     for org in organisms:
+        # Only reset simulation-specific state, not physical state if it survived
         org.fitness = 0
-        org.is_alive = True
-        org.time_since_last_meal = 0
-        # Reset position/velocity to random for fair start each gen
-        org.x = uniform(settings["x_min"], settings["x_max"])
-        org.y = uniform(settings["y_min"], settings["y_max"])
-        org.r = uniform(0, 360)
-        org.v = uniform(0, settings["v_max"])
-        # Sensory inputs will be updated each step
-        org.d_food = float("inf")
+        org.is_alive = True  # Assume alive at start of gen
+        org.energy = initial_energy  # Reset energy for all
+        org.ate_corpse_recently = False
+        # Reset sensor inputs for the first step
+        org.d_food = inf
         org.r_food = 0.0
+        org.d_org = inf
+        org.r_org = 0.0
+        org.d_org_norm = 1.0  # Default normalized distance (max)
+        org.nn_dv = 0.0
+        org.nn_dr = 0.0
 
-    # --- SIMULATION TIME STEP LOOP -----------------------+
-    for t_step in range(total_time_steps):
+    gen_ended_early_death = False
+    actual_steps = 0
+    for t_step in range(max_time_steps):
+        actual_steps = t_step + 1
 
-        # --- Check for window closure signal ---
         if settings["plot"]:
             if fig is None or not plt.fignum_exists(fig.number):
-                print("\nPlot window closed detected inside simulate.")
-                return organisms, True  # Signal closure
-
-            # --- Plotting ---
+                return organisms, True  # Signal window closed
             if t_step % plot_interval == 0:
                 plot_frame_live(settings, organisms, foods, gen, t_step)
 
-        # Track which living organisms ate this step
-        org_ate_this_step = {
-            i: False for i, org in enumerate(organisms) if org.is_alive
-        }
+        current_dead_count = 0
+        living_org_indices = [i for i, org in enumerate(organisms) if org.is_alive]
 
-        # --- Interaction & State Update Loop ---
-        for i, org in enumerate(organisms):
-            if not org.is_alive:
-                continue  # Skip dead organisms
+        # --- Step 1: Sensing, Metabolism, Death Check, Eating, Thinking ---
+        for i in living_org_indices:
+            org = organisms[i]
 
-            # 1. Sensing: Find closest food
+            # Metabolism and Death Check
+            org.energy -= energy_per_step
+            if org.energy <= 0:
+                org.is_alive = False
+                org.fitness = 0  # Lose fitness on death
+                # Create Corpse
+                for food_slot in foods:
+                    if not food_slot.is_active:
+                        food_slot.become_corpse(org.x, org.y, corpse_fitness)
+                        break
+                continue  # Skip rest for this newly dead organism
+
+            # --- Sensing ---
+            # Food Sensing
             org.d_food = float("inf")
             nearest_food_idx = -1
+            ate_this_step = False
             for j, food in enumerate(foods):
-                food_org_dist = dist(org.x, org.y, food.x, food.y)
+                if not food.is_active:
+                    continue
+                dx, dy = food.x - org.x, food.y - org.y
+                dist_sq = dx * dx + dy * dy
 
-                # Check for eating food first
-                if food_org_dist <= settings["collision_radius"]:
+                # Eating Check
+                if dist_sq <= collision_radius_sq:
                     org.fitness += food.energy
-                    food.respawn(settings)
-                    org.time_since_last_meal = 0  # Reset starvation timer!
-                    org_ate_this_step[i] = True
-                    # Assume can only eat one food particle per time step
-                    break  # Move to next organism after eating
+                    energy_gain = (
+                        corpse_energy_gain if food.is_corpse else energy_per_food
+                    )
+                    org.energy = min(org.energy + energy_gain, max_energy)
+                    if food.is_corpse:
+                        org.ate_corpse_recently = True
+                    food.respawn(settings)  # Respawn food
+                    ate_this_step = True
+                    # Considered food eaten, reset food sensor for NN this step
+                    org.d_food = 0.0  # Indicate food present/eaten
+                    org.r_food = 0.0
+                    break  # Ate one item
 
-                # If not eaten, check if this food is the closest seen so far
-                elif food_org_dist < org.d_food:
-                    org.d_food = food_org_dist
+                # Find Closest Food (if not eaten)
+                elif dist_sq < org.d_food**2:
+                    org.d_food = sqrt(dist_sq)
                     nearest_food_idx = j
 
-            # Calculate heading to closest food (if one was found and not eaten)
-            if not org_ate_this_step[i] and nearest_food_idx != -1:
-                org.r_food = calc_heading(org, foods[nearest_food_idx])
-            else:
-                # If ate, or no food nearby, heading input is zero
+            # Calculate food heading if food sensed and not eaten
+            if not ate_this_step and nearest_food_idx != -1:
+                if foods[nearest_food_idx].is_active:  # Check if still there
+                    org.r_food = calc_heading(
+                        org, foods[nearest_food_idx].x, foods[nearest_food_idx].y
+                    )
+                else:  # Food gone
+                    org.d_food = float("inf")
+                    org.r_food = 0.0
+            elif not ate_this_step:  # No food seen
+                org.d_food = float("inf")
                 org.r_food = 0.0
 
-            # 2. Starvation Update (if didn't eat this step)
-            if not org_ate_this_step[i]:
-                org.time_since_last_meal += 1
-                if org.time_since_last_meal > starvation_threshold:
-                    org.is_alive = False
-                    org.fitness = 0  # Dead organisms contribute no fitness
-                    # Optional: Stop movement immediately upon death
-                    # org.v = 0
+            # Organism Sensing
+            org.d_org = float("inf")
+            org.r_org = 0.0
+            org.d_org_norm = 1.0  # Default: no organism nearby
+            nearest_org_dist_sq = sensor_radius_sq  # Start search within sensor range
 
-            # 3. Thinking & Movement (only if still alive after starvation check)
-            if org.is_alive:
-                # Ensure weights are valid
-                if (
-                    org.wih is None
-                    or org.who is None
-                    or org.wih.shape != (settings["hnodes"], settings["inodes"])
-                    or org.who.shape != (settings["onodes"], settings["hnodes"])
-                ):
-                    continue  # Skip if weights are malformed
+            for k in living_org_indices:
+                if i == k:
+                    continue  # Don't sense self
+                other_org = organisms[k]
+                dx, dy = other_org.x - org.x, other_org.y - org.y
+                dist_sq = dx * dx + dy * dy
 
-                org.think()
-                org.update_r(settings)
-                org.update_vel(settings)
-                org.update_pos(settings)
+                if dist_sq < nearest_org_dist_sq:
+                    nearest_org_dist_sq = dist_sq
+                    org.d_org = sqrt(dist_sq)  # Actual distance
+                    org.r_org = calc_heading(
+                        org, other_org.x, other_org.y
+                    )  # Relative angle [-1, 1]
+                    org.d_org_norm = (
+                        org.d_org / sensor_radius
+                    )  # Normalized distance [0, 1)
 
-    # Simulation loop finished for this generation
-    return organisms, False  # Return status: window was not closed
+            # --- Thinking ---
+            org.think()  # Uses org.r_food, org.r_org, org.d_org_norm
+
+        # --- Update living list after potential deaths ---
+        living_org_indices = [i for i, org in enumerate(organisms) if org.is_alive]
+        current_dead_count = settings["pop_size"] - len(living_org_indices)
+
+        # --- Step 2: Calculate Intended Movement & Check Collisions ---
+        collision_pairs = set()  # Avoid double checks/effects
+        bounce_applied = {
+            i: False for i in living_org_indices
+        }  # Track who bounced this step
+
+        for i_idx, i in enumerate(living_org_indices):
+            org1 = organisms[i]
+
+            # Calculate intended rotation and velocity change for this step
+            org1.calculate_dv_dr()  # Store intended dv, dr based on NN output
+
+            # Check for collisions with organisms later in the list
+            for j in living_org_indices[i_idx + 1 :]:
+                org2 = organisms[j]
+
+                pair = tuple(sorted((i, j)))  # Unique identifier for the pair
+                if pair in collision_pairs:
+                    continue  # Already processed this pair
+
+                dx, dy = org1.x - org2.x, org1.y - org2.y
+                dist_sq = dx * dx + dy * dy
+
+                if dist_sq <= collision_radius_sq:
+                    collision_pairs.add(pair)  # Mark pair as checked
+
+                    # Determine winner/loser based on energy
+                    loser = None
+                    winner = None
+                    if org1.energy < org2.energy:
+                        loser, winner = org1, org2
+                        loser_idx, winner_idx = i, j
+                    elif org2.energy < org1.energy:
+                        loser, winner = org2, org1
+                        loser_idx, winner_idx = j, i
+                    else:  # Equal energy, no bounce
+                        if debug_collisions:
+                            print(
+                                f"  Collision: {org1.name} (E:{org1.energy:.0f}) vs {org2.name} (E:{org2.energy:.0f}). EQUAL ENERGY - No bounce."
+                            )
+                        continue  # Skip to next pair
+
+                    # Apply bounce effect only if loser hasn't bounced already this step
+                    if not bounce_applied[loser_idx]:
+                        if debug_collisions:
+                            print(
+                                f"  Collision: {winner.name} (E:{winner.energy:.0f}) wins vs {loser.name} (E:{loser.energy:.0f}). Applying bounce."
+                            )
+
+                        # Loser bounces: reverse direction, reduce velocity
+                        loser.r = (loser.r + 180.0) % 360.0
+                        loser.v *= bounce_vel_mult
+                        # Ensure velocity doesn't go negative (shouldn't with multiplier)
+                        loser.v = max(0.0, loser.v)
+
+                        # Mark loser as having bounced this step
+                        bounce_applied[loser_idx] = True
+
+                    # Note: Winner continues with their calculated move (no change here)
+
+        # --- Step 3: Apply Movement (Update r, v, then position) ---
+        for i in living_org_indices:
+            org = organisms[i]
+            # Update rotation and velocity based on stored NN outputs (or direct modification if bounced)
+            org.update_r(settings)  # Applies the stored delta_r
+            org.update_vel(settings)  # Applies the stored delta_v
+
+            # Update position using potentially modified r and v
+            org.update_pos(settings)
+
+        # Check Generation End Condition (Death Threshold)
+        if current_dead_count >= death_limit_count:
+            print(
+                f"  Gen {gen} ended early: step {t_step+1}, deaths {current_dead_count}/{settings['pop_size']}."
+            )
+            gen_ended_early_death = True
+            break
+
+    # --- End of Generation ---
+    if not gen_ended_early_death:
+        final_dead_count = sum(1 for org in organisms if not org.is_alive)
+        print(
+            f"  Gen {gen} finished max time ({actual_steps} steps). Deaths: {final_dead_count}"
+        )
+
+    return organisms, False  # Return False for window status (not closed)
 
 
-# --- CLASSES ------------------------------------------------------------------+
-
-
+# --- CLASSES (Food unchanged, Organism updated for sensing/NN) --------+
 class food:
-    """Represents a food particle."""
-
+    # (Identical to v2)
     def __init__(self, settings):
         self.settings = settings
-        self.respawn(settings)
-        self.energy = 1  # Amount of fitness gained when eaten
+        self.respawn(settings)  # Initial spawn
+        self.energy = 1
 
     def respawn(self, settings):
-        """Place the food particle at a random location within bounds."""
         self.x = uniform(settings["x_min"], settings["x_max"])
         self.y = uniform(settings["y_min"], settings["y_max"])
+        self.is_active = True
+        self.is_corpse = False
+        self.energy = 1
+
+    def become_corpse(self, x, y, fitness_value):
+        self.x = x
+        self.y = y
+        self.is_active = True
+        self.is_corpse = True
+        self.energy = fitness_value
 
 
 class organism:
-    """Represents an organism with NN brain, state, and survival status."""
-
-    def __init__(self, settings, wih=None, who=None, name=None):
-        self.settings = settings  # Store settings reference
-
-        # --- NN Architecture ---
-        self.inodes = settings["inodes"]
+    def __init__(self, settings, wih=None, who=None, name=None, initial_state=None):
+        self.settings = settings
+        self.inodes = settings["inodes"]  # Now 3
         self.hnodes = settings["hnodes"]
-        self.onodes = settings["onodes"]
+        self.onodes = settings["onodes"]  # Now 2
 
-        # --- Weights ---
-        # Initialize randomly if not provided or if shape is incorrect
+        # Weights - Initialize randomly if None or shape mismatch
         if wih is None or wih.shape != (self.hnodes, self.inodes):
             self.wih = np.random.uniform(-1, 1, (self.hnodes, self.inodes))
             if wih is not None:
-                print(f"Warning: Correcting WIH shape for {name}")
+                print(
+                    f"Warning: {name} received incompatible wih shape {wih.shape}, expected {(self.hnodes, self.inodes)}. Reinitialized."
+                )
         else:
-            self.wih = wih.copy()  # Important: Copy arrays
+            self.wih = wih.copy()
 
         if who is None or who.shape != (self.onodes, self.hnodes):
             self.who = np.random.uniform(-1, 1, (self.onodes, self.hnodes))
             if who is not None:
-                print(f"Warning: Correcting WHO shape for {name}")
+                print(
+                    f"Warning: {name} received incompatible who shape {who.shape}, expected {(self.onodes, self.hnodes)}. Reinitialized."
+                )
         else:
-            self.who = who.copy()  # Important: Copy arrays
+            self.who = who.copy()
 
-        # --- State Variables (initialized/reset each generation by simulate) ---
-        self.x = uniform(settings["x_min"], settings["x_max"])
-        self.y = uniform(settings["y_min"], settings["y_max"])
-        self.r = uniform(0, 360)  # Orientation [0, 360] degrees
-        self.v = uniform(0, settings["v_max"])  # Velocity [0, v_max]
-        self.fitness = 0  # Accumulated score for the current gen
-        self.is_alive = True  # Survival status
-        self.time_since_last_meal = 0  # Starvation counter
+        # State Variables
+        if initial_state:  # Carry over state for survivors
+            self.x, self.y, self.r, self.v = (
+                initial_state["x"],
+                initial_state["y"],
+                initial_state["r"],
+                initial_state["v"],
+            )
+            # Energy is reset in simulate()
+        else:  # Default state for new offspring
+            self.x = uniform(settings["x_min"], settings["x_max"])
+            self.y = uniform(settings["y_min"], settings["y_max"])
+            self.r = uniform(0, 360)  # Degrees
+            self.v = uniform(0, settings["v_max"])
 
-        # --- Sensory Input (updated each time step) ---
-        self.d_food = float("inf")  # Distance to nearest food
-        self.r_food = 0.0  # Normalized heading [-1, 1]
-
-        # --- NN Outputs (calculated by think) ---
-        self.nn_dv = 0.0  # Scaler for velocity change [-1, 1]
-        self.nn_dr = 0.0  # Scaler for rotation change [-1, 1]
-
-        # --- Identity ---
-        self.name = name if name else f"org_{randint(1000,9999)}"
+        # Simulation Variables (Reset each generation in simulate())
+        self.fitness = 0
+        self.is_alive = True
+        self.energy = settings["initial_energy"]
+        self.ate_corpse_recently = False
+        # Sensor Inputs
+        self.d_food = inf
+        self.r_food = 0.0  # [-1, 1]
+        self.d_org = inf
+        self.r_org = 0.0  # [-1, 1]
+        self.d_org_norm = 1.0  # [0, 1]
+        # NN Outputs / Deltas
+        self.nn_dv_signal = 0.0  # Raw NN output for dv scaler
+        self.nn_dr_signal = 0.0  # Raw NN output for dr scaler
+        self.delta_v = 0.0  # Calculated change in v for the step
+        self.delta_r = 0.0  # Calculated change in r for the step
+        # ---
+        self.name = name if name else f"org_{randint(1000, 9999)}"
 
     def think(self):
-        """Use NN to determine desired change in velocity and rotation."""
+        """Use NN to determine desired change scales (dv, dr) based on sensor inputs."""
         if not self.is_alive:
-            return  # Dead organisms don't think
+            return
 
-        # Input: Normalized heading [-1, 1]
-        nn_input = np.array([[self.r_food]])  # Shape: (inodes, 1) = (1, 1)
+        # --- Prepare Input Vector ---
+        # Inputs: [relative_food_angle, relative_org_angle, normalized_org_dist]
+        nn_input = np.array(
+            [[self.r_food], [self.r_org], [self.d_org_norm]]
+        )  # Shape: (inodes, 1) = (3, 1)
 
-        # Activation function
-        af = np.tanh  # Use numpy's tanh directly for arrays
+        # --- Define Activation Function ---
+        af = np.tanh  # Using tanh for hidden and output layers
 
+        # --- Forward Pass ---
         # Hidden layer: h = act( W_ih * input )
         h1 = af(np.dot(self.wih, nn_input))  # Shape: (hnodes, 1)
 
         # Output layer: out = act( W_ho * h )
-        out = af(np.dot(self.who, h1))  # Shape: (onodes, 1)
+        out = af(np.dot(self.who, h1))  # Shape: (onodes, 1) = (2, 1)
 
-        # Assign outputs to control variables
-        self.nn_dv = float(out[0, 0])  # Velocity change scaler
-        self.nn_dr = float(out[1, 0])  # Rotation change scaler
+        # --- Store NN Output Signals ---
+        self.nn_dv_signal = float(out[0, 0])  # Scaler for velocity change [-1, 1]
+        self.nn_dr_signal = float(out[1, 0])  # Scaler for rotation change [-1, 1]
+
+    def calculate_dv_dr(self):
+        """Calculate the actual delta_v and delta_r for this step based on NN signals."""
+        if not self.is_alive:
+            return
+        # Calculate velocity change based on NN output signal
+        self.delta_v = self.nn_dv_signal * self.settings["dv_max"] * self.settings["dt"]
+        # Calculate rotation change based on NN output signal
+        self.delta_r = self.nn_dr_signal * self.settings["dr_max"] * self.settings["dt"]
 
     def update_r(self, settings):
-        """Update orientation based on NN output nn_dr."""
+        """Apply the calculated rotation change."""
         if not self.is_alive:
             return
-        # Calculate change in rotation
-        delta_r = self.nn_dr * settings["dr_max"] * settings["dt"]
-        # Update and wrap angle
-        self.r = (self.r + delta_r) % 360
+        # Note: self.r might have been directly modified by collision logic before this
+        self.r = (self.r + self.delta_r) % 360.0
 
     def update_vel(self, settings):
-        """Update velocity based on NN output nn_dv."""
+        """Apply the calculated velocity change, respecting limits."""
         if not self.is_alive:
             return
-        # Calculate change in velocity (acceleration * time)
-        delta_v = self.nn_dv * settings["dv_max"] * settings["dt"]
-        # Update velocity
-        self.v += delta_v
+        # Note: self.v might have been directly modified by collision logic before this
+        self.v = self.v + self.delta_v
         # Clamp velocity to [0, v_max]
         self.v = max(0.0, min(self.v, settings["v_max"]))
 
     def update_pos(self, settings):
-        """Update position based on velocity, orientation. Apply wrap-around."""
+        """Update position based on current velocity and orientation. Apply wrap-around."""
         if not self.is_alive:
             return
         # Calculate position change
@@ -597,7 +682,6 @@ class organism:
         # Update position
         self.x += dx
         self.y += dy
-
         # Apply toroidal world wrap-around
         world_width = settings["x_max"] - settings["x_min"]
         world_height = settings["y_max"] - settings["y_min"]
@@ -611,160 +695,119 @@ class organism:
             self.y -= world_height
 
 
-# --- MAIN RUN FUNCTION --------------------------------------------------------+
-
-
+# --- MAIN RUN FUNCTION (Minor change for debug message) ----------------------
 def run(settings):
-    """Sets up and runs the evolutionary simulation."""
-    global fig, ax, simulation_stopped_early  # Allow modification
-    simulation_stopped_early = False  # Reset at start
-
-    # Setup plotting window if enabled
+    global fig, ax, simulation_stopped_early
+    simulation_stopped_early = False
     if settings["plot"]:
         setup_live_plot(settings)
 
-    # Initialize environment
-    print("Initializing food...")
+    print(f"Initializing food pool (size {settings['food_num']})...")
     foods = [food(settings) for _ in range(settings["food_num"])]
-    print("Initializing organisms (Generation 0)...")
+    print(f"Initializing organisms (Gen 0, size {settings['pop_size']})...")
+    print(
+        f"NN Architecture: Inputs={settings['inodes']}, Hidden={settings['hnodes']}, Outputs={settings['onodes']}"
+    )
     organisms = [
         organism(settings, name=f"gen[0]-org[{i}]") for i in range(settings["pop_size"])
     ]
 
-    # Data storage and timing
     stats_history = []
     start_total_time = time.time()
-
-    # --- GENERATION LOOP ---
     print(
-        f"\nStarting simulation: {settings['gens']} generations, {int(settings['gen_time'] / settings['dt'])} steps/gen"
+        f"\nStarting simulation: {settings['gens']} generations OR until {settings['death_threshold_percent']*100:.0f}% death per gen."
     )
+    if settings["debug_collisions"]:
+        print(">>> Collision Debugging Enabled <<<")
     generations_completed = 0
+    extinction_occurred = False
+
     for gen in range(settings["gens"]):
         gen_start_time = time.time()
-
-        # 1. SIMULATE the current population
-        #    - Resets organism states (pos, vel, fitness, alive, starvation)
-        #    - Runs time steps: sense, think, act, move, eat, starve, die
-        #    - Returns updated organism list and window closure status
+        # Reset states inside simulate() now handles initial state better
         organisms, was_closed = simulate(settings, organisms, foods, gen)
-
-        # Check if user closed the plot window during simulation
         if was_closed:
             simulation_stopped_early = True
-            print("Stopping simulation loop due to window closure.")
-            break  # Exit generation loop
+            print("Stopping loop due to plot window closure.")
+            break
 
-        # 2. EVOLVE the population for the next generation
-        #    - Filters for survivors (is_alive == True)
-        #    - Calculates stats based on survivors' fitness
-        #    - Selects elites (copies weights)
-        #    - Breeds offspring (crossover, mutation of weights)
-        #    - Returns a *new* list of organism objects for the next generation
-        organisms, stats = evolve(settings, organisms, gen + 1)  # Evolve for gen+1
-        stats_history.append(stats)
+        organisms_next, stats = evolve(
+            settings, organisms, gen + 1
+        )  # Evolve uses survivors
         generations_completed = gen + 1
 
-        # Print generation summary stats
+        if not organisms_next:  # Extinction
+            extinction_occurred = True
+            stats_history.append(stats)  # Record stats of the last gen
+            print(f"> GEN: {gen} | Survivors: 0 | EXTINCTION")
+            break
+
+        organisms = organisms_next  # Prepare for next generation
+        stats_history.append(stats)
         gen_end_time = time.time()
-        living_count = stats.get("COUNT", "N/A")  # Get survivor count from evolve stats
+        living_count = stats.get("COUNT", "N/A")
         print(
-            f"> GEN: {gen} | Survivors: {living_count:>3} | BEST_fit: {stats['BEST']:<6.1f} | AVG_fit: {stats['AVG']:<6.2f} | WORST_fit: {stats['WORST']:<6.1f} | Duration: {gen_end_time - gen_start_time:.2f}s"
+            f"> GEN: {gen:<3} | Survivors: {living_count:>3} | BEST_fit: {stats['BEST']:<6.1f} | AVG_fit: {stats['AVG']:<6.2f} | WORST_fit: {stats['WORST']:<6.1f} | Duration: {gen_end_time - gen_start_time:.2f}s"
         )
 
     # --- POST-SIMULATION ---
     end_total_time = time.time()
-    print(f"\n--- Simulation Loop Finished ---")
+    print("\n--- Simulation Loop Finished ---")
     print(f"Generations run: {generations_completed}")
+    if extinction_occurred:
+        print("   ##### Population went extinct! #####")
     if simulation_stopped_early:
-        print("(Simulation was stopped early by user action)")
+        print("(Simulation was stopped early by user action or plot closure)")
     print(f"Total wall time: {end_total_time - start_total_time:.2f} seconds.")
 
-    # --- Optional: Plot overall statistics graph ---
+    # Plot stats (same as before)
     if stats_history and not simulation_stopped_early:
         print("\nDisplaying overall fitness statistics graph...")
         try:
-            # Create a new, separate figure for the stats plot
             stats_fig, stats_ax = plt.subplots(figsize=(10, 5))
-            generations_axis = list(range(len(stats_history)))
-            best_fitness = [s["BEST"] for s in stats_history]
-            avg_fitness = [s["AVG"] for s in stats_history]
-            worst_fitness = [s["WORST"] for s in stats_history]
-            survivor_counts = [s["COUNT"] for s in stats_history]  # Get survivor counts
-
-            # Plot fitness lines
-            stats_ax.plot(
-                generations_axis, best_fitness, label="Best Fitness", color="green"
-            )
-            stats_ax.plot(
-                generations_axis, avg_fitness, label="Average Fitness", color="blue"
-            )
-            stats_ax.plot(
-                generations_axis,
-                worst_fitness,
-                label="Worst Fitness",
-                color="red",
-                linestyle=":",
-            )
+            gens_axis = list(range(len(stats_history)))
+            best = [s["BEST"] for s in stats_history]
+            avg = [s["AVG"] for s in stats_history]
+            worst = [s["WORST"] for s in stats_history]
+            survivors = [s["COUNT"] for s in stats_history]
+            stats_ax.plot(gens_axis, best, label="Best", c="g")
+            stats_ax.plot(gens_axis, avg, label="Avg", c="b")
+            stats_ax.plot(gens_axis, worst, label="Worst", c="r", ls=":")
             stats_ax.set_xlabel("Generation")
-            stats_ax.set_ylabel("Fitness (Food Eaten)", color="black")
-            stats_ax.tick_params(axis="y", labelcolor="black")
+            stats_ax.set_ylabel("Fitness")
             stats_ax.legend(loc="upper left")
             stats_ax.grid(True)
-
-            # Add a secondary y-axis for survivor count
             ax2 = stats_ax.twinx()
-            ax2.plot(
-                generations_axis,
-                survivor_counts,
-                label="Survivors",
-                color="purple",
-                linestyle="--",
-            )
-            ax2.set_ylabel("Number of Survivors", color="purple")
+            ax2.plot(gens_axis, survivors, label="Survivors", c="purple", ls="--")
+            ax2.set_ylabel("Survivors", c="purple")
             ax2.tick_params(axis="y", labelcolor="purple")
-            # Set survivor axis limits appropriately (0 to pop_size + buffer)
             ax2.set_ylim(0, settings["pop_size"] * 1.1)
             ax2.legend(loc="upper right")
-
-            stats_fig.tight_layout()  # Adjust plot to prevent overlap
-            stats_ax.set_title("Evolution of Fitness and Survivor Count")
-
-            # Turn interactive mode off before showing blocking plot
+            stats_fig.tight_layout()
+            stats_ax.set_title("Fitness & Survivor Count")
             plt.ioff()
-            plt.show()  # This blocks until the stats window is closed
+            plt.show()
         except Exception as e_stats:
-            print(f"Could not display stats graph: {e_stats}")
-            traceback.print_exc()  # Print full error for stats plot issue
-
-    elif simulation_stopped_early:
-        print("\nSkipping statistics graph because simulation was stopped early.")
-
-    print("\nRun function finished.")
+            print(f"Stats plot error: {e_stats}")
+            traceback.print_exc()
+    # ... rest of post-simulation messages ...
 
 
-# --- SCRIPT ENTRY POINT -------------------------------------------------------+
-
+# --- SCRIPT ENTRY POINT (Unchanged) --------------------------+
 if __name__ == "__main__":
-    print("Executing script...")
+    print("Executing script (organism_v3.py)...")
     try:
         run(settings)
     except KeyboardInterrupt:
-        print("\n--- Simulation interrupted by user (Ctrl+C) ---")
-        simulation_stopped_early = True  # Ensure cleanup knows it was stopped
+        print("\n--- Interrupted by user (Ctrl+C) ---")
+        simulation_stopped_early = True
     except Exception as e:
-        print(f"\n--- An unhandled error occurred during execution ---")
-        traceback.print_exc()  # Print the full error stack trace
-        simulation_stopped_early = True  # Assume stop on error for cleanup
+        print("\n--- Unhandled error ---")
+        traceback.print_exc()
+        simulation_stopped_early = True
     finally:
-        # --- Cleanup ---
-        print("\nFinal cleanup: Closing any open Matplotlib figures...")
-        # Turning interactive mode off can sometimes help closing behavior
+        print("\nFinal cleanup: Closing Matplotlib figures.")
         plt.ioff()
-        plt.close("all")  # Close all figures managed by pyplot state machine
-        print("Cleanup complete. Exiting script.")
-        # Optional: Set exit code based on whether it finished normally
-        # exit_code = 1 if simulation_stopped_early else 0
-        # sys.exit(exit_code)
-
+        plt.close("all")
+        print("Cleanup complete.")
 # --- END ----------------------------------------------------------------------+
